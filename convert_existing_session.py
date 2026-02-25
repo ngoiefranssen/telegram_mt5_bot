@@ -25,19 +25,19 @@ async def convert_session():
     await client.connect()
     
     if not await client.is_user_authorized():
-        print("\n❌ La session existante n'est pas valide ou expirée")
+        print("\n La session existante n'est pas valide ou expirée")
         print("Utilisez generate_session_string.py pour créer une nouvelle session")
         await client.disconnect()
         return
     
     me = await client.get_me()
-    print(f"\n✅ Session valide!")
-    print(f"✅ Connecté en tant que: {me.first_name}")
-    print(f"✅ Numéro: {me.phone}")
-    
+    print(f"\n Session valide!")
+    print(f" Connecté en tant que: {me.first_name}")
+    print(f" Numéro: {me.phone}")
+
     # Convert to StringSession
     session_string = StringSession.save(client.session)
-    
+
     print("\n" + "=" * 70)
     print("SESSION STRING GÉNÉRÉE AVEC SUCCÈS!")
     print("=" * 70)
@@ -45,8 +45,8 @@ async def convert_session():
     print("\n" + "-" * 70)
     print(session_string)
     print("-" * 70)
-    
-    print("\n📋 ÉTAPES POUR RENDER:")
+
+    print("\n ÉTAPES POUR RENDER:")
     print("1. Allez dans votre service Render")
     print("2. Cliquez sur 'Environment'")
     print("3. Ajoutez une nouvelle variable:")
@@ -54,7 +54,7 @@ async def convert_session():
     print("   Value: [collez la session string ci-dessus]")
     print("4. Sauvegardez et redéployez")
     print("\n" + "=" * 70)
-    
+
     await client.disconnect()
 
 if __name__ == '__main__':

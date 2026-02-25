@@ -26,8 +26,8 @@ async def create_session():
     await client.start()
     
     me = await client.get_me()
-    print(f"\n✅ Connecté en tant que: {me.first_name}")
-    print(f"✅ Numéro: {me.phone}")
+    print(f"\n Connecté en tant que: {me.first_name}")
+    print(f" Numéro: {me.phone}")
     
     print("\n" + "=" * 60)
     print("SESSION CRÉÉE AVEC SUCCÈS!")

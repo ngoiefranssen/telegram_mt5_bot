@@ -18,6 +18,7 @@ import os
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
+from aiohttp import web
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -187,8 +188,8 @@ class TelegramDerivBot:
         # Résolution du canal
         try:
             self.channel_entity = await self.client.get_entity(CONFIG['channel_username'])
-            logger.info(f"[Telegram] 📡 Canal cible: {self.channel_entity.title}")
-            logger.info(f"[Telegram] 🆔 ID: {self.channel_entity.id}")
+            logger.info(f"[Telegram] Canal cible: {self.channel_entity.title}")
+            logger.info(f"[Telegram] ID: {self.channel_entity.id}")
         except Exception as e:
             logger.error(f"[Telegram] Erreur canal: {e}")
             raise
@@ -265,6 +266,7 @@ class TelegramDerivBot:
             # Symbol mapping: Telegram signal format → Deriv API format
             symbol_map = {
                 'XAUUSD': 'frxXAUUSD',  # Gold
+                'XAGUSD': 'frxXAGUSD',  # argent
                 'EURUSD': 'frxEURUSD',  # Euro/US Dollar
                 'GBPUSD': 'frxGBPUSD',  # British Pound/US Dollar
                 'USDJPY': 'frxUSDJPY',  # US Dollar/Japanese Yen
@@ -344,7 +346,7 @@ class TelegramDerivBot:
                     logger.error("[TRADE] Deriv API not connected")
                     logger.info("[TRADE] Attempting to reconnect...")
                     if await self._connect_deriv():
-                        logger.info("[TRADE] ✅ Reconnected successfully")
+                        logger.info("[TRADE] Reconnected successfully")
                     else:
                         logger.error("[TRADE] Reconnection failed - Trade skipped")
                         return False
@@ -652,10 +654,33 @@ def validate_config():
     return True
 
 
+async def health_check(request):
+    """Health check endpoint for Render"""
+    return web.Response(text="Bot is running", status=200)
+
+
+async def start_http_server():
+    """Start HTTP server for Render port binding"""
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', health_check)
+    
+    port = int(os.getenv('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"[HTTP] Server started on port {port}")
+    return runner
+
+
 async def main():
     if not validate_config():
         exit(1)
-        
+    
+    # Start HTTP server for Render
+    http_runner = await start_http_server()
+    
     bot = TelegramDerivBot()
     try:
         await bot.run()
@@ -665,6 +690,7 @@ async def main():
         logger.error(f" Erreur fatale: {e}", exc_info=True)
     finally:
         bot.shutdown()
+        await http_runner.cleanup()
 
 
 if __name__ == "__main__":

@@ -32,8 +32,8 @@ async def generate_session_string():
     await client.start()
     
     me = await client.get_me()
-    print(f"\n✅ Connecté en tant que: {me.first_name}")
-    print(f"✅ Numéro: {me.phone}")
+    print(f"\n Connecté en tant que: {me.first_name}")
+    print(f" Numéro: {me.phone}")
     
     # Get the session string
     session_string = client.session.save()
@@ -46,7 +46,7 @@ async def generate_session_string():
     print(session_string)
     print("-" * 70)
     
-    print("\n📋 ÉTAPES POUR RENDER:")
+    print("\n ÉTAPES POUR RENDER:")
     print("1. Allez dans votre service Render")
     print("2. Cliquez sur 'Environment'")
     print("3. Ajoutez une nouvelle variable:")
