@@ -1,6 +1,3 @@
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Bot Trading Telegram -> Deriv API
 Capture les signaux du canal Hunto Trader et exécute via Deriv API
@@ -69,16 +66,16 @@ class TradingSignal:
     def display(self):
         """Affichage formaté du signal"""
         return f"""
-╔══════════════════════════════════════════════════════════╗
-║  📊 SIGNAL DÉTECTÉ                                       ║
-╠══════════════════════════════════════════════════════════╣
-║  Symbole:     {self.symbol:<36} ║
-║  Direction:   {self.direction:<36} ║
-║  Entrée:      {self.entry_price:<36} ║
-║  SL:          {self.stop_loss:<36} ║
-║  TPs:         {str(self.take_profits):<36} ║
-║  Heure:       {self.received_at.strftime('%H:%M:%S'):<36} ║
-╚══════════════════════════════════════════════════════════╝
+
+    SIGNAL DÉTECTÉ
+
+    Symbole:     {self.symbol:<36}
+    Direction:   {self.direction:<36}
+    Entrée:      {self.entry_price:<36}
+    SL:          {self.stop_loss:<36}
+    TPs:         {str(self.take_profits):<36}
+    Heure:       {self.received_at.strftime('%H:%M:%S'):<36}
+
 """
 
 
@@ -93,12 +90,12 @@ class TelegramDerivBot:
     async def initialize(self):
         """Initialisation du bot"""
         logger.info("=" * 60)
-        logger.info("🚀 DÉMARRAGE DU BOT TRADING TELEGRAM -> DERIV API")
+        logger.info("DÉMARRAGE DU BOT TRADING TELEGRAM -> DERIV API")
         logger.info("=" * 60)
         
         # Connexion Deriv API
         if not await self._connect_deriv():
-            raise Exception("❌ Impossible de connecter Deriv API")
+            raise Exception("Impossible de connecter Deriv API")
             
         # Connexion Telegram
         await self._connect_telegram()
@@ -125,7 +122,7 @@ class TelegramDerivBot:
             if 'error' in auth_response:
                 error_code = auth_response['error'].get('code', 'unknown')
                 error_msg = auth_response['error'].get('message', 'Unknown error')
-                logger.error(f"[Deriv API] ❌ Authentication failure (code: {error_code}): {error_msg}")
+                logger.error(f"[Deriv API] Authentication failure (code: {error_code}): {error_msg}")
                 logger.error(f"[Deriv API] Please verify DERIV_API_TOKEN in .env file")
                 logger.error(f"[Deriv API] Obtain token from: https://app.deriv.com/account/api-token")
                 return False
@@ -137,24 +134,24 @@ class TelegramDerivBot:
             
             if 'error' in balance_response:
                 error_msg = balance_response['error'].get('message', 'Unknown error')
-                logger.error(f"[Deriv API] ❌ Error fetching balance: {error_msg}")
+                logger.error(f"[Deriv API] Error fetching balance: {error_msg}")
                 return False
             
             if 'balance' in balance_response:
                 balance = balance_response['balance']['balance']
                 currency = balance_response['balance']['currency']
-                logger.info(f"[Deriv API] ✅ Connecté")
-                logger.info(f"[Deriv API] 💰 Balance: {balance} {currency}")
+                logger.info(f"[Deriv API] Connecté")
+                logger.info(f"[Deriv API] Balance: {balance} {currency}")
             
             self.deriv_connected = True
             return True
             
         except websockets.exceptions.WebSocketException as e:
-            logger.error(f"[Deriv API] ❌ WebSocket connection error: {e}")
+            logger.error(f"[Deriv API] WebSocket connection error: {e}")
             logger.error(f"[Deriv API] Check network connectivity and firewall settings")
             return False
         except Exception as e:
-            logger.error(f"[Deriv API] ❌ Unexpected connection error: {e}")
+            logger.error(f"[Deriv API] Unexpected connection error: {e}")
             logger.exception(e)
             return False
         
@@ -185,7 +182,7 @@ class TelegramDerivBot:
         
         await self.client.start()
         me = await self.client.get_me()
-        logger.info(f"[Telegram] ✅ Connecté en tant que {me.first_name}")
+        logger.info(f"[Telegram]  Connecté en tant que {me.first_name}")
         
         # Résolution du canal
         try:
@@ -193,7 +190,7 @@ class TelegramDerivBot:
             logger.info(f"[Telegram] 📡 Canal cible: {self.channel_entity.title}")
             logger.info(f"[Telegram] 🆔 ID: {self.channel_entity.id}")
         except Exception as e:
-            logger.error(f"[Telegram] ❌ Erreur canal: {e}")
+            logger.error(f"[Telegram] Erreur canal: {e}")
             raise
             
     def parse_signal(self, text: str) -> Optional[TradingSignal]:
@@ -252,7 +249,7 @@ class TelegramDerivBot:
             
             # Affichage immédiat du signal détecté
             print(signal.display())
-            logger.info(f"[Parser] ✅ Signal valide: {direction} {symbol} @ {entry_price}")
+            logger.info(f"[Parser]  Signal valide: {direction} {symbol} @ {entry_price}")
             
             return signal
             
@@ -286,7 +283,7 @@ class TelegramDerivBot:
             deriv_symbol = symbol_map.get(symbol.upper())
 
             if not deriv_symbol:
-                logger.error(f"[Symbol] ❌ Invalid symbol: {symbol} - No mapping found")
+                logger.error(f"[Symbol] Invalid symbol: {symbol} - No mapping found")
                 logger.info(f"[Symbol] Available symbols: {', '.join(symbol_map.keys())}")
                 logger.info(f"[Symbol] Trade skipped for invalid symbol")
                 return None
@@ -296,7 +293,7 @@ class TelegramDerivBot:
             # Validate symbol with Deriv API
             try:
                 if not self.deriv_ws:
-                    logger.error("[Symbol] ❌ Deriv WebSocket not connected")
+                    logger.error("[Symbol] Deriv WebSocket not connected")
                     return None
 
                 # Request active symbols from Deriv API
@@ -310,7 +307,7 @@ class TelegramDerivBot:
                 if 'error' in response:
                     error_code = response['error'].get('code', 'unknown')
                     error_msg = response['error'].get('message', 'Unknown error')
-                    logger.error(f"[Symbol] ❌ Deriv API error (code: {error_code}): {error_msg}")
+                    logger.error(f"[Symbol] Deriv API error (code: {error_code}): {error_msg}")
                     logger.info(f"[Symbol] Trade skipped due to API error")
                     return None
 
@@ -320,19 +317,19 @@ class TelegramDerivBot:
                     symbol_exists = any(s['symbol'] == deriv_symbol for s in active_symbols)
 
                     if symbol_exists:
-                        logger.info(f"[Symbol] ✅ Validated: {deriv_symbol}")
+                        logger.info(f"[Symbol]  Validated: {deriv_symbol}")
                         return deriv_symbol
                     else:
-                        logger.error(f"[Symbol] ❌ Invalid symbol: {deriv_symbol} not found in active symbols")
+                        logger.error(f"[Symbol] Invalid symbol: {deriv_symbol} not found in active symbols")
                         logger.info(f"[Symbol] Trade skipped for invalid symbol")
                         return None
 
             except websockets.exceptions.WebSocketException as e:
-                logger.error(f"[Symbol] ❌ WebSocket error validating symbol: {e}")
+                logger.error(f"[Symbol] WebSocket error validating symbol: {e}")
                 logger.info(f"[Symbol] Trade skipped due to connection error")
                 return None
             except Exception as e:
-                logger.error(f"[Symbol] ❌ Unexpected error validating symbol: {e}")
+                logger.error(f"[Symbol] Unexpected error validating symbol: {e}")
                 logger.exception(e)
                 logger.info(f"[Symbol] Trade skipped due to error")
                 return None
@@ -344,18 +341,18 @@ class TelegramDerivBot:
             """
             try:
                 if not self.deriv_ws or not self.deriv_connected:
-                    logger.error("[TRADE] ❌ Deriv API not connected")
+                    logger.error("[TRADE] Deriv API not connected")
                     logger.info("[TRADE] Attempting to reconnect...")
                     if await self._connect_deriv():
                         logger.info("[TRADE] ✅ Reconnected successfully")
                     else:
-                        logger.error("[TRADE] ❌ Reconnection failed - Trade skipped")
+                        logger.error("[TRADE] Reconnection failed - Trade skipped")
                         return False
 
                 # Find correct Deriv symbol
                 deriv_symbol = await self.find_correct_symbol(signal.symbol)
                 if not deriv_symbol:
-                    logger.error(f"[TRADE] ❌ Cannot map symbol {signal.symbol} - Trade skipped")
+                    logger.error(f"[TRADE] Cannot map symbol {signal.symbol} - Trade skipped")
                     return False
 
                 # Get current price for the symbol
@@ -369,16 +366,16 @@ class TelegramDerivBot:
                     
                     # Handle market closed error
                     if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
-                        logger.error(f"[TRADE] ❌ Market closed for {deriv_symbol}")
+                        logger.error(f"[TRADE] Market closed for {deriv_symbol}")
                         logger.info(f"[TRADE] Trade will be retried when market opens")
                         return False
                     
-                    logger.error(f"[TRADE] ❌ Error getting price (code: {error_code}): {error_msg}")
+                    logger.error(f"[TRADE] Error getting price (code: {error_code}): {error_msg}")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
                 if 'tick' not in tick_response:
-                    logger.error(f"[TRADE] ❌ No tick data received for {deriv_symbol}")
+                    logger.error(f"[TRADE] No tick data received for {deriv_symbol}")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
@@ -449,35 +446,35 @@ class TelegramDerivBot:
                     
                     # Handle insufficient balance error
                     if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
-                        logger.error(f"[TRADE] ❌ Insufficient balance to execute trade")
+                        logger.error(f"[TRADE] Insufficient balance to execute trade")
                         logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
                         logger.info(f"[TRADE] Trade skipped due to insufficient funds")
                         return False
                     
                     # Handle market closed error
                     if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
-                        logger.error(f"[TRADE] ❌ Market closed for {deriv_symbol}")
+                        logger.error(f"[TRADE] Market closed for {deriv_symbol}")
                         logger.info(f"[TRADE] Trade will be retried when market opens")
                         return False
                     
                     # Handle invalid symbol error
                     if 'symbol' in error_msg.lower() or error_code == 'InvalidSymbol':
-                        logger.error(f"[TRADE] ❌ Invalid symbol: {deriv_symbol}")
+                        logger.error(f"[TRADE] Invalid symbol: {deriv_symbol}")
                         logger.info(f"[TRADE] Trade skipped due to invalid symbol")
                         return False
                     
                     # Generic error handling
-                    logger.error(f"[TRADE] ❌ Proposal error (code: {error_code}): {error_msg}")
+                    logger.error(f"[TRADE] Proposal error (code: {error_code}): {error_msg}")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
                 if 'proposal' not in proposal_response:
-                    logger.error(f"[TRADE] ❌ Invalid proposal response")
+                    logger.error(f"[TRADE] Invalid proposal response")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
                 proposal_id = proposal_response['proposal']['id']
-                logger.info(f"[TRADE] ✅ Proposal validated: {proposal_id}")
+                logger.info(f"[TRADE]  Proposal validated: {proposal_id}")
 
                 # Execute trade via buy API (equivalent to MT5's order_send)
                 buy_request = {
@@ -495,37 +492,35 @@ class TelegramDerivBot:
                     
                     # Handle insufficient balance error
                     if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
-                        logger.error(f"[TRADE] ❌ Insufficient balance to execute trade")
+                        logger.error(f"[TRADE] Insufficient balance to execute trade")
                         logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
                         logger.info(f"[TRADE] Trade skipped due to insufficient funds")
                         return False
                     
                     # Handle authentication failure
                     if 'auth' in error_msg.lower() or error_code in ['AuthorizationRequired', 'InvalidToken']:
-                        logger.error(f"[TRADE] ❌ Authentication failure: {error_msg}")
+                        logger.error(f"[TRADE] Authentication failure: {error_msg}")
                         logger.info(f"[TRADE] Attempting to reconnect...")
                         if await self._connect_deriv():
-                            logger.info(f"[TRADE] ✅ Reconnected - Please retry trade manually")
+                            logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
                         else:
-                            logger.error(f"[TRADE] ❌ Reconnection failed")
+                            logger.error(f"[TRADE] Reconnection failed")
                         return False
                     
-                    # Generic error handling
-                    logger.error(f"[TRADE] ❌ Buy error (code: {error_code}): {error_msg}")
+                    logger.error(f"[TRADE] Buy error (code: {error_code}): {error_msg}")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
                 if 'buy' not in buy_response:
-                    logger.error(f"[TRADE] ❌ Invalid buy response")
+                    logger.error(f"[TRADE] Invalid buy response")
                     logger.info(f"[TRADE] Trade skipped")
                     return False
 
-                # Trade executed successfully (equivalent to TRADE_RETCODE_DONE in MT5)
                 contract_id = buy_response['buy']['contract_id']
                 buy_price = buy_response['buy']['buy_price']
 
                 logger.info("=" * 60)
-                logger.info("✅ TRADE EXECUTED SUCCESSFULLY")
+                logger.info(" TRADE EXECUTED SUCCESSFULLY")
                 logger.info(f"Contract ID: {contract_id}")
                 logger.info(f"Symbol: {deriv_symbol}")
                 logger.info(f"Type: {contract_type}")
@@ -537,25 +532,22 @@ class TelegramDerivBot:
                 logger.info(f"Stop Loss: {signal.stop_loss}")
                 logger.info("=" * 60)
 
-                # Note: Deriv API doesn't support automatic TP/SL in the same way as MT5
-                # TP/SL would need to be managed separately via stop_loss/take_profit contracts
-                # or monitored manually. For now, we log them for manual management.
                 if first_tp or signal.stop_loss:
-                    logger.warning("[TRADE] ⚠️ TP/SL logged for manual management")
+                    logger.warning("[TRADE] TP/SL logged for manual management")
                     logger.warning(f"[TRADE] Monitor contract {contract_id} and close at TP: {first_tp} or SL: {signal.stop_loss}")
 
                 return True
 
             except websockets.exceptions.WebSocketException as e:
-                logger.error(f"[TRADE] ❌ WebSocket error executing trade: {e}")
+                logger.error(f"[TRADE] WebSocket error executing trade: {e}")
                 logger.info(f"[TRADE] Attempting to reconnect...")
                 if await self._connect_deriv():
-                    logger.info(f"[TRADE] ✅ Reconnected - Please retry trade manually")
+                    logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
                 else:
-                    logger.error(f"[TRADE] ❌ Reconnection failed")
+                    logger.error(f"[TRADE] Reconnection failed")
                 return False
             except Exception as e:
-                logger.error(f"[TRADE] ❌ Unexpected error executing trade: {e}")
+                logger.error(f"[TRADE] Unexpected error executing trade: {e}")
                 logger.exception(e)
                 logger.info(f"[TRADE] Trade skipped due to error")
                 return False
@@ -566,7 +558,7 @@ class TelegramDerivBot:
             # Vérifier si c'est le bon canal
             if event.chat_id != self.channel_entity.id:
                 return
-                
+
             # Éviter les doublons
             msg_id = event.message.id
             if msg_id in self.processed_messages:
@@ -582,12 +574,12 @@ class TelegramDerivBot:
                 return
                 
             logger.info("-" * 60)
-            logger.info(f"[Telegram] 📩 Nouveau message du canal")
+            logger.info(f"[Telegram] Nouveau message du canal")
             
             # Parsing et exécution
             signal = self.parse_signal(text)
             if signal is None:
-                logger.info("[Telegram] ℹ️ Message ignoré (pas un signal)")
+                logger.info("[Telegram] Message ignoré (pas un signal)")
                 return
                 
             # Exécution immédiate
@@ -595,40 +587,40 @@ class TelegramDerivBot:
             
             if success:
                 print(f"\n{'='*60}")
-                print("✅ SIGNAL TRAITÉ AVEC SUCCÈS")
+                print(" SIGNAL TRAITÉ AVEC SUCCÈS")
                 print(f"{'='*60}\n")
             else:
                 print(f"\n{'='*60}")
-                print("❌ ÉCHEC DU TRAITEMENT")
+                print("ÉCHEC DU TRAITEMENT")
                 print(f"{'='*60}\n")
                 
         except Exception as e:
-            logger.error(f"[Handler] 💥 Erreur: {e}", exc_info=True)
+            logger.error(f"[Handler] Erreur: {e}", exc_info=True)
             
     async def run(self):
         """Boucle principale"""
         await self.initialize()
-        
+
         # Enregistrement du handler pour le canal spécifique
         @self.client.on(events.NewMessage(chats=self.channel_entity))
         async def handler(event):
             await self.handle_new_message(event)
             
         print(f"\n{'='*60}")
-        print("🤖 BOT EN ÉCOUTE...")
-        print(f"📡 Canal: {self.channel_entity.title}")
-        print("⏹️  Appuyez sur Ctrl+C pour arrêter")
+        print("BOT EN ÉCOUTE...")
+        print(f"Canal: {self.channel_entity.title}")
+        print("Appuyez sur Ctrl+C pour arrêter")
         print(f"{'='*60}\n")
         
         await self.client.run_until_disconnected()
         
     def shutdown(self):
         """Arrêt propre"""
-        logger.info("[System] 🛑 Arrêt du bot...")
+        logger.info("[System] Arrêt du bot...")
         if self.deriv_connected and self.deriv_ws:
             asyncio.create_task(self.deriv_ws.close())
             logger.info("[Deriv API] Déconnecté")
-        print("👋 Bot arrêté")
+        print("Bot arrêté")
 
 
 def validate_config():
@@ -643,22 +635,17 @@ def validate_config():
     missing = [k for k, v in required.items() if not v or v == 0]
     
     if missing:
-        print("\n" + "❌"*30)
+        print("\n" + "*30")
         print("ERREUR: Configuration incomplète!")
-        print("❌"*30)
+        print("*30")
         print(f"\nVariables manquantes: {', '.join(missing)}")
         print("\nCréez un fichier .env avec:")
         print("-" * 40)
-        print("TELEGRAM_API_ID=33159970")
-        print('TELEGRAM_API_HASH="33f09424ad95a65f1961d1e6ca2a0de2"')
-        print('CHANNEL_USERNAME="hunto4x_fullaccourcy92"')
         print('DERIV_API_TOKEN="your_api_token_here"  # Obtain from https://app.deriv.com/account/api-token')
         print('DERIV_APP_ID="1089"  # Default for binary.com')
         print("FIXED_LOT=0.02")
         print("-" * 40)
-        print("\n⚠️  Deprecated (no longer used):")
-        print("# MT5_ACCOUNT=32121223")
-        print('# MT5_PASSWORD="Do!02@_07#.~"')
+        print("\n  Deprecated (no longer used):")
         print('# MT5_SERVER="Deriv-Demo"')
         print("-" * 40)
         return False
@@ -673,9 +660,9 @@ async def main():
     try:
         await bot.run()
     except KeyboardInterrupt:
-        print("\n\n⏹️  Interruption par l'utilisateur")
+        print("\n\n Interruption par l'utilisateur")
     except Exception as e:
-        logger.error(f"💥 Erreur fatale: {e}", exc_info=True)
+        logger.error(f" Erreur fatale: {e}", exc_info=True)
     finally:
         bot.shutdown()
 
