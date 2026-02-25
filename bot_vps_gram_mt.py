@@ -162,11 +162,26 @@ class TelegramDerivBot:
         """Connexion à Telegram"""
         logger.info("[Telegram] Connexion...")
         
-        self.client = TelegramClient(
-            'trading_session',
-            CONFIG['telegram_api_id'],
-            CONFIG['telegram_api_hash']
-        )
+        # Check if we have a session string from environment (for Render deployment)
+        session_string = os.getenv('TELEGRAM_SESSION')
+        
+        if session_string:
+            # Use StringSession for deployment
+            from telethon.sessions import StringSession
+            logger.info("[Telegram] Utilisation de la session depuis variable d'environnement")
+            self.client = TelegramClient(
+                StringSession(session_string),
+                CONFIG['telegram_api_id'],
+                CONFIG['telegram_api_hash']
+            )
+        else:
+            # Use file-based session for local development
+            logger.info("[Telegram] Utilisation de la session fichier (développement local)")
+            self.client = TelegramClient(
+                'trading_session',
+                CONFIG['telegram_api_id'],
+                CONFIG['telegram_api_hash']
+            )
         
         await self.client.start()
         me = await self.client.get_me()
