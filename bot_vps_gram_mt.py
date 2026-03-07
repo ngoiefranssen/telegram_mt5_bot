@@ -15,9 +15,9 @@ import re
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from aiohttp import web
 
 # Charger les variables d'environnement
@@ -51,7 +51,86 @@ CONFIG = {
     
     'fixed_lot': float(os.getenv('FIXED_LOT', '0.02')),
     'magic_number': 234000,
+    'history_file': os.getenv('TRADE_HISTORY_FILE', 'trade_history.jsonl'),
+    'monitor_poll_seconds': int(os.getenv('MONITOR_POLL_SECONDS', '30')),
 }
+
+
+class TradeHistoryStore:
+    """Persist trade events and compute rolling summaries."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        event = {
+            "ts": datetime.utcnow().isoformat(),
+            "event_type": event_type,
+            **payload,
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=True) + "\n")
+
+    def _load_events(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.path):
+            return []
+        events: List[Dict[str, Any]] = []
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("[History] Invalid JSON line skipped")
+        return events
+
+    def summarize(self, days: int) -> Dict[str, int]:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        events = self._load_events()
+        filtered: List[Dict[str, Any]] = []
+        for event in events:
+            ts_raw = event.get("ts")
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                filtered.append(event)
+
+        trades_taken = sum(1 for e in filtered if e.get("event_type") == "trade_opened")
+        execution_failures = sum(1 for e in filtered if e.get("event_type") == "trade_execution_failed")
+        gains = sum(
+            1
+            for e in filtered
+            if e.get("event_type") == "trade_closed" and e.get("outcome") == "gain"
+        )
+        echec = sum(
+            1
+            for e in filtered
+            if e.get("event_type") == "trade_closed" and e.get("outcome") == "echec"
+        )
+        flat = sum(
+            1
+            for e in filtered
+            if e.get("event_type") == "trade_closed" and e.get("outcome") == "flat"
+        )
+        total_closed = gains + echec + flat
+        pending = max(trades_taken - total_closed, 0)
+        total_all = trades_taken + execution_failures
+        return {
+            "trades_taken": trades_taken,
+            "gains": gains,
+            "echec": echec,
+            "flat": flat,
+            "total_closed": total_closed,
+            "pending": pending,
+            "execution_failures": execution_failures,
+            "total_all": total_all,
+        }
 
 @dataclass
 class TradingSignal:
@@ -85,14 +164,108 @@ class TelegramDerivBot:
         self.client: Optional[TelegramClient] = None
         self.deriv_connected = False
         self.deriv_ws = None
+        self.ws_lock = asyncio.Lock()
         self.processed_messages = set()
         self.channel_entity = None
+        self.history = TradeHistoryStore(CONFIG['history_file'])
+        self.monitor_tasks = set()
+
+    async def _ws_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.deriv_ws:
+            raise RuntimeError("Deriv WebSocket is not connected")
+        async with self.ws_lock:
+            await self.deriv_ws.send(json.dumps(payload))
+            return json.loads(await self.deriv_ws.recv())
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self.monitor_tasks.add(task)
+        task.add_done_callback(self.monitor_tasks.discard)
+
+    def _log_history_summary(self) -> None:
+        week = self.history.summarize(7)
+        month = self.history.summarize(30)
+        logger.info(
+            "[History] 7j trades=%s gain=%s echec=%s total=%s",
+            week["trades_taken"],
+            week["gains"],
+            week["echec"],
+            week["total_all"],
+        )
+        logger.info(
+            "[History] 30j trades=%s gain=%s echec=%s total=%s",
+            month["trades_taken"],
+            month["gains"],
+            month["echec"],
+            month["total_all"],
+        )
+
+    async def _monitor_contract_result(
+        self,
+        contract_id: int,
+        signal: TradingSignal,
+        deriv_symbol: str,
+        contract_type: str,
+    ) -> None:
+        """Poll Deriv until contract closes, then record gain/echec."""
+        try:
+            max_checks = max(int((8 * 60 * 60) / max(CONFIG['monitor_poll_seconds'], 5)), 1)
+            for _ in range(max_checks):
+                response = await self._ws_request({
+                    "proposal_open_contract": 1,
+                    "contract_id": contract_id,
+                })
+                if 'error' in response:
+                    await asyncio.sleep(CONFIG['monitor_poll_seconds'])
+                    continue
+
+                poc = response.get("proposal_open_contract", {})
+                if not poc.get("is_sold"):
+                    await asyncio.sleep(CONFIG['monitor_poll_seconds'])
+                    continue
+
+                profit = float(poc.get("profit", 0.0))
+                if profit > 0:
+                    outcome = "gain"
+                elif profit < 0:
+                    outcome = "echec"
+                else:
+                    outcome = "flat"
+
+                self.history.record_event(
+                    "trade_closed",
+                    {
+                        "contract_id": contract_id,
+                        "symbol": signal.symbol,
+                        "deriv_symbol": deriv_symbol,
+                        "direction": signal.direction,
+                        "contract_type": contract_type,
+                        "entry_price": signal.entry_price,
+                        "tp": signal.take_profits[0] if signal.take_profits else None,
+                        "sl": signal.stop_loss,
+                        "profit": profit,
+                        "outcome": outcome,
+                    },
+                )
+                logger.info(
+                    "[TRADE] Contract %s closed outcome=%s profit=%s",
+                    contract_id,
+                    outcome,
+                    profit,
+                )
+                self._log_history_summary()
+                return
+        except asyncio.CancelledError:
+            logger.info("[TRADE] Monitor task cancelled for contract %s", contract_id)
+            raise
+        except Exception as e:
+            logger.error("[TRADE] Monitor error for contract %s: %s", contract_id, e)
         
     async def initialize(self):
         """Initialisation du bot"""
         logger.info("=" * 60)
         logger.info("DÉMARRAGE DU BOT TRADING TELEGRAM -> DERIV API")
         logger.info("=" * 60)
+        self._log_history_summary()
         
         # Connexion Deriv API
         if not await self._connect_deriv():
@@ -117,8 +290,7 @@ class TelegramDerivBot:
             auth_request = {
                 "authorize": CONFIG['deriv_api_token']
             }
-            await self.deriv_ws.send(json.dumps(auth_request))
-            auth_response = json.loads(await self.deriv_ws.recv())
+            auth_response = await self._ws_request(auth_request)
             
             if 'error' in auth_response:
                 error_code = auth_response['error'].get('code', 'unknown')
@@ -129,9 +301,8 @@ class TelegramDerivBot:
                 return False
             
             # Get account info
-            balance_request = {"balance": 1, "subscribe": 1}
-            await self.deriv_ws.send(json.dumps(balance_request))
-            balance_response = json.loads(await self.deriv_ws.recv())
+            balance_request = {"balance": 1, "subscribe": 0}
+            balance_response = await self._ws_request(balance_request)
             
             if 'error' in balance_response:
                 error_msg = balance_response['error'].get('message', 'Unknown error')
@@ -303,8 +474,7 @@ class TelegramDerivBot:
                     "active_symbols": "brief",
                     "product_type": "basic"
                 }
-                await self.deriv_ws.send(json.dumps(active_symbols_request))
-                response = json.loads(await self.deriv_ws.recv())
+                response = await self._ws_request(active_symbols_request)
 
                 if 'error' in response:
                     error_code = response['error'].get('code', 'unknown')
@@ -338,8 +508,8 @@ class TelegramDerivBot:
         
     async def execute_trade(self, signal: TradingSignal) -> bool:
             """
-            Execute trade via Deriv API contract purchase
-            Maps MT5 order types to Deriv contract types and handles TP/SL
+            Execute trade immediately from Telegram signal.
+            BUY -> CALL, SELL -> PUT (no LIMIT/STOP logic).
             """
             try:
                 if not self.deriv_ws or not self.deriv_connected:
@@ -357,72 +527,27 @@ class TelegramDerivBot:
                     logger.error(f"[TRADE] Cannot map symbol {signal.symbol} - Trade skipped")
                     return False
 
-                # Get current price for the symbol
-                tick_request = {"ticks": deriv_symbol, "subscribe": 0}
-                await self.deriv_ws.send(json.dumps(tick_request))
-                tick_response = json.loads(await self.deriv_ws.recv())
-
-                if 'error' in tick_response:
-                    error_code = tick_response['error'].get('code', 'unknown')
-                    error_msg = tick_response['error'].get('message', 'Unknown error')
-                    
-                    # Handle market closed error
-                    if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
-                        logger.error(f"[TRADE] Market closed for {deriv_symbol}")
-                        logger.info(f"[TRADE] Trade will be retried when market opens")
-                        return False
-                    
-                    logger.error(f"[TRADE] Error getting price (code: {error_code}): {error_msg}")
-                    logger.info(f"[TRADE] Trade skipped")
-                    return False
-
-                if 'tick' not in tick_response:
-                    logger.error(f"[TRADE] No tick data received for {deriv_symbol}")
-                    logger.info(f"[TRADE] Trade skipped")
-                    return False
-
-                current_price = float(tick_response['tick']['quote'])
-                logger.info(f"[TRADE] Current price for {deriv_symbol}: {current_price}")
-
-                # Determine order type using preserved logic
-                point = 0.01  # Standard point size
-                price_diff = abs(current_price - signal.entry_price)
-
-                # Order type determination (preserved from original MT5 logic)
                 if signal.direction == "BUY":
-                    if price_diff <= 10 * point:
-                        order_type = "MARKET_BUY"
-                        contract_type = "CALL"
-                    elif signal.entry_price < current_price:
-                        order_type = "BUY_LIMIT"
-                        contract_type = "CALL"
-                    else:
-                        order_type = "BUY_STOP"
-                        contract_type = "CALL"
-                else:  # SELL
-                    if price_diff <= 10 * point:
-                        order_type = "MARKET_SELL"
-                        contract_type = "PUT"
-                    elif signal.entry_price > current_price:
-                        order_type = "SELL_LIMIT"
-                        contract_type = "PUT"
-                    else:
-                        order_type = "SELL_STOP"
-                        contract_type = "PUT"
+                    contract_type = "CALL"
+                elif signal.direction == "SELL":
+                    contract_type = "PUT"
+                else:
+                    logger.error(f"[TRADE] Invalid direction: {signal.direction}")
+                    return False
 
-                logger.info(f"[TRADE] Order type: {order_type} → Contract type: {contract_type}")
+                logger.info(f"[TRADE] Immediate market execution: {signal.direction} -> {contract_type}")
 
                 # Calculate stake from lot size (0.02 lot = $2 stake for simplicity)
                 # Note: Deriv uses stake amount, not lot size
                 stake = CONFIG['fixed_lot'] * 100  # 0.02 * 100 = $2
 
-                # Handle multiple TPs - use first TP, log others
+                # Handle multiple TPs - Deriv limit_order supports a single TP level
                 first_tp = signal.take_profits[0] if signal.take_profits else None
                 if len(signal.take_profits) > 1:
                     logger.info(f"[TRADE] Multiple TPs detected: {signal.take_profits}")
-                    logger.info(f"[TRADE] Using first TP: {first_tp}, others logged for manual management")
+                    logger.info(f"[TRADE] Using first TP for order: {first_tp}")
 
-                # Create proposal request (equivalent to MT5's order_check)
+                # Create proposal request for immediate execution
                 proposal_request = {
                     "proposal": 1,
                     "amount": stake,
@@ -434,45 +559,114 @@ class TelegramDerivBot:
                     "duration_unit": "m"
                 }
 
-                # Add limit price for LIMIT orders
-                if "LIMIT" in order_type:
-                    proposal_request["barrier"] = str(signal.entry_price)
+                # Attempt to attach TP/SL directly to the order when supported by Deriv.
+                limit_order = {}
+                if first_tp is not None:
+                    limit_order["take_profit"] = float(first_tp)
+                if signal.stop_loss is not None:
+                    limit_order["stop_loss"] = float(signal.stop_loss)
+                if limit_order:
+                    proposal_request["limit_order"] = limit_order
 
                 logger.info(f"[TRADE] Sending proposal request: {proposal_request}")
-                await self.deriv_ws.send(json.dumps(proposal_request))
-                proposal_response = json.loads(await self.deriv_ws.recv())
+                proposal_response = await self._ws_request(proposal_request)
 
                 if 'error' in proposal_response:
                     error_code = proposal_response['error'].get('code', 'unknown')
                     error_msg = proposal_response['error'].get('message', 'Unknown error')
+
+                    if "limit_order" in proposal_request:
+                        logger.error("[TRADE] TP/SL rejected by Deriv API: %s", error_msg)
+                        logger.error("[TRADE] Trade skipped: TP/SL must be attached")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": f"tp_sl_rejected:{error_code}",
+                            },
+                        )
+                        self._log_history_summary()
+                        return False
                     
                     # Handle insufficient balance error
                     if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
                         logger.error(f"[TRADE] Insufficient balance to execute trade")
                         logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
                         logger.info(f"[TRADE] Trade skipped due to insufficient funds")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": "insufficient_balance",
+                            },
+                        )
+                        self._log_history_summary()
                         return False
                     
                     # Handle market closed error
                     if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
                         logger.error(f"[TRADE] Market closed for {deriv_symbol}")
                         logger.info(f"[TRADE] Trade will be retried when market opens")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": "market_closed",
+                            },
+                        )
+                        self._log_history_summary()
                         return False
                     
                     # Handle invalid symbol error
                     if 'symbol' in error_msg.lower() or error_code == 'InvalidSymbol':
                         logger.error(f"[TRADE] Invalid symbol: {deriv_symbol}")
                         logger.info(f"[TRADE] Trade skipped due to invalid symbol")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": "invalid_symbol",
+                            },
+                        )
+                        self._log_history_summary()
                         return False
                     
                     # Generic error handling
                     logger.error(f"[TRADE] Proposal error (code: {error_code}): {error_msg}")
                     logger.info(f"[TRADE] Trade skipped")
+                    self.history.record_event(
+                        "trade_execution_failed",
+                        {
+                            "symbol": signal.symbol,
+                            "direction": signal.direction,
+                            "entry_price": signal.entry_price,
+                            "reason": f"proposal_error:{error_code}",
+                        },
+                    )
+                    self._log_history_summary()
                     return False
 
                 if 'proposal' not in proposal_response:
                     logger.error(f"[TRADE] Invalid proposal response")
                     logger.info(f"[TRADE] Trade skipped")
+                    self.history.record_event(
+                        "trade_execution_failed",
+                        {
+                            "symbol": signal.symbol,
+                            "direction": signal.direction,
+                            "entry_price": signal.entry_price,
+                            "reason": "invalid_proposal_response",
+                        },
+                    )
+                    self._log_history_summary()
                     return False
 
                 proposal_id = proposal_response['proposal']['id']
@@ -485,8 +679,7 @@ class TelegramDerivBot:
                 }
 
                 logger.info(f"[TRADE] Executing buy request: {buy_request}")
-                await self.deriv_ws.send(json.dumps(buy_request))
-                buy_response = json.loads(await self.deriv_ws.recv())
+                buy_response = await self._ws_request(buy_request)
 
                 if 'error' in buy_response:
                     error_code = buy_response['error'].get('code', 'unknown')
@@ -497,6 +690,16 @@ class TelegramDerivBot:
                         logger.error(f"[TRADE] Insufficient balance to execute trade")
                         logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
                         logger.info(f"[TRADE] Trade skipped due to insufficient funds")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": "insufficient_balance",
+                            },
+                        )
+                        self._log_history_summary()
                         return False
                     
                     # Handle authentication failure
@@ -507,15 +710,45 @@ class TelegramDerivBot:
                             logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
                         else:
                             logger.error(f"[TRADE] Reconnection failed")
+                        self.history.record_event(
+                            "trade_execution_failed",
+                            {
+                                "symbol": signal.symbol,
+                                "direction": signal.direction,
+                                "entry_price": signal.entry_price,
+                                "reason": "auth_failure",
+                            },
+                        )
+                        self._log_history_summary()
                         return False
                     
                     logger.error(f"[TRADE] Buy error (code: {error_code}): {error_msg}")
                     logger.info(f"[TRADE] Trade skipped")
+                    self.history.record_event(
+                        "trade_execution_failed",
+                        {
+                            "symbol": signal.symbol,
+                            "direction": signal.direction,
+                            "entry_price": signal.entry_price,
+                            "reason": f"buy_error:{error_code}",
+                        },
+                    )
+                    self._log_history_summary()
                     return False
 
                 if 'buy' not in buy_response:
                     logger.error(f"[TRADE] Invalid buy response")
                     logger.info(f"[TRADE] Trade skipped")
+                    self.history.record_event(
+                        "trade_execution_failed",
+                        {
+                            "symbol": signal.symbol,
+                            "direction": signal.direction,
+                            "entry_price": signal.entry_price,
+                            "reason": "invalid_buy_response",
+                        },
+                    )
+                    self._log_history_summary()
                     return False
 
                 contract_id = buy_response['buy']['contract_id']
@@ -535,8 +768,28 @@ class TelegramDerivBot:
                 logger.info("=" * 60)
 
                 if first_tp or signal.stop_loss:
-                    logger.warning("[TRADE] TP/SL logged for manual management")
-                    logger.warning(f"[TRADE] Monitor contract {contract_id} and close at TP: {first_tp} or SL: {signal.stop_loss}")
+                    logger.info("[TRADE] TP/SL requested on order")
+
+                self.history.record_event(
+                    "trade_opened",
+                    {
+                        "contract_id": contract_id,
+                        "symbol": signal.symbol,
+                        "deriv_symbol": deriv_symbol,
+                        "direction": signal.direction,
+                        "contract_type": contract_type,
+                        "entry_price": signal.entry_price,
+                        "buy_price": buy_price,
+                        "stake": stake,
+                        "tp": first_tp,
+                        "sl": signal.stop_loss,
+                    },
+                )
+                self._log_history_summary()
+                monitor_task = asyncio.create_task(
+                    self._monitor_contract_result(contract_id, signal, deriv_symbol, contract_type)
+                )
+                self._track_task(monitor_task)
 
                 return True
 
@@ -547,11 +800,31 @@ class TelegramDerivBot:
                     logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
                 else:
                     logger.error(f"[TRADE] Reconnection failed")
+                self.history.record_event(
+                    "trade_execution_failed",
+                    {
+                        "symbol": signal.symbol,
+                        "direction": signal.direction,
+                        "entry_price": signal.entry_price,
+                        "reason": "websocket_error",
+                    },
+                )
+                self._log_history_summary()
                 return False
             except Exception as e:
                 logger.error(f"[TRADE] Unexpected error executing trade: {e}")
                 logger.exception(e)
                 logger.info(f"[TRADE] Trade skipped due to error")
+                self.history.record_event(
+                    "trade_execution_failed",
+                    {
+                        "symbol": signal.symbol,
+                        "direction": signal.direction,
+                        "entry_price": signal.entry_price,
+                        "reason": "unexpected_error",
+                    },
+                )
+                self._log_history_summary()
                 return False
             
     async def handle_new_message(self, event):
@@ -585,7 +858,7 @@ class TelegramDerivBot:
                 return
                 
             # Exécution immédiate
-            success = self.execute_trade(signal)
+            success = await self.execute_trade(signal)
             
             if success:
                 print(f"\n{'='*60}")
@@ -619,6 +892,8 @@ class TelegramDerivBot:
     def shutdown(self):
         """Arrêt propre"""
         logger.info("[System] Arrêt du bot...")
+        for task in list(self.monitor_tasks):
+            task.cancel()
         if self.deriv_connected and self.deriv_ws:
             asyncio.create_task(self.deriv_ws.close())
             logger.info("[Deriv API] Déconnecté")
@@ -659,11 +934,22 @@ async def health_check(request):
     return web.Response(text="Bot is running", status=200)
 
 
-async def start_http_server():
+async def stats_handler(request):
+    """Expose week/month trade statistics."""
+    bot: TelegramDerivBot = request.app["bot"]
+    return web.json_response({
+        "week_7d": bot.history.summarize(7),
+        "month_30d": bot.history.summarize(30),
+    })
+
+
+async def start_http_server(bot: TelegramDerivBot):
     """Start HTTP server for Render port binding"""
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get('/health', health_check)
     app.router.add_get('/', health_check)
+    app.router.add_get('/stats', stats_handler)
     
     port = int(os.getenv('PORT', 10000))
     runner = web.AppRunner(app)
@@ -677,11 +963,10 @@ async def start_http_server():
 async def main():
     if not validate_config():
         exit(1)
-    
-    # Start HTTP server for Render
-    http_runner = await start_http_server()
-    
+
     bot = TelegramDerivBot()
+    # Start HTTP server for Render
+    http_runner = await start_http_server(bot)
     try:
         await bot.run()
     except KeyboardInterrupt:
