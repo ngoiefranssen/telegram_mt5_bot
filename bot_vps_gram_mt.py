@@ -408,7 +408,7 @@ class TelegramDerivBot:
             
             if not take_profits or sl_price is None:
                 return None
-                
+            #
             signal = TradingSignal(
                 symbol=symbol,
                 direction=direction,
