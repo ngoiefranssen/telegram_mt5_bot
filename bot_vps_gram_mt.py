@@ -9,7 +9,7 @@ import websockets
 import aiohttp
 import json
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils as telethon_utils
 from dotenv import load_dotenv
 import re
 import asyncio
@@ -359,8 +359,10 @@ class TelegramDerivBot:
         # Résolution du canal
         try:
             self.channel_entity = await self.client.get_entity(CONFIG['channel_username'])
+            marked_chat_id = telethon_utils.get_peer_id(self.channel_entity)
             logger.info(f"[Telegram] Canal cible: {self.channel_entity.title}")
             logger.info(f"[Telegram] ID: {self.channel_entity.id}")
+            logger.info(f"[Telegram] Marked chat_id: {marked_chat_id}")
         except Exception as e:
             logger.error(f"[Telegram] Erreur canal: {e}")
             raise
@@ -571,24 +573,17 @@ class TelegramDerivBot:
                 logger.info(f"[TRADE] Sending proposal request: {proposal_request}")
                 proposal_response = await self._ws_request(proposal_request)
 
+                if 'error' in proposal_response and "limit_order" in proposal_request:
+                    error_msg = proposal_response['error'].get('message', 'Unknown error')
+                    logger.warning("[TRADE] TP/SL not accepted on this contract type by Deriv API: %s", error_msg)
+                    logger.warning("[TRADE] Retrying immediate market order without TP/SL attachment")
+                    proposal_request = {k: v for k, v in proposal_request.items() if k != "limit_order"}
+                    logger.info(f"[TRADE] Sending fallback proposal request: {proposal_request}")
+                    proposal_response = await self._ws_request(proposal_request)
+
                 if 'error' in proposal_response:
                     error_code = proposal_response['error'].get('code', 'unknown')
                     error_msg = proposal_response['error'].get('message', 'Unknown error')
-
-                    if "limit_order" in proposal_request:
-                        logger.error("[TRADE] TP/SL rejected by Deriv API: %s", error_msg)
-                        logger.error("[TRADE] Trade skipped: TP/SL must be attached")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": f"tp_sl_rejected:{error_code}",
-                            },
-                        )
-                        self._log_history_summary()
-                        return False
                     
                     # Handle insufficient balance error
                     if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
@@ -830,8 +825,14 @@ class TelegramDerivBot:
     async def handle_new_message(self, event):
         """Gestionnaire de nouveaux messages"""
         try:
-            # Vérifier si c'est le bon canal
-            if event.chat_id != self.channel_entity.id:
+            # Safety check when called directly (handler already filters by channel).
+            expected_chat_id = telethon_utils.get_peer_id(self.channel_entity) if self.channel_entity else None
+            if expected_chat_id is not None and event.chat_id != expected_chat_id:
+                logger.info(
+                    "[Telegram] Message ignoré (chat différent): event.chat_id=%s expected=%s",
+                    event.chat_id,
+                    expected_chat_id,
+                )
                 return
 
             # Éviter les doublons
@@ -849,7 +850,7 @@ class TelegramDerivBot:
                 return
                 
             logger.info("-" * 60)
-            logger.info(f"[Telegram] Nouveau message du canal")
+            logger.info(f"[Telegram] Nouveau message du canal (chat_id={event.chat_id}, msg_id={msg_id})")
             
             # Parsing et exécution
             signal = self.parse_signal(text)
