@@ -50,6 +50,8 @@ CONFIG = {
     # 'mt5_server': os.getenv('MT5_SERVER', ''),
     
     'fixed_lot': float(os.getenv('FIXED_LOT', '0.02')),
+    'target_tp_number': int(os.getenv('TARGET_TP_NUMBER', '4')),
+    'trades_per_signal': int(os.getenv('TRADES_PER_SIGNAL', '2')),
     'magic_number': 234000,
     'history_file': os.getenv('TRADE_HISTORY_FILE', 'trade_history.jsonl'),
     'monitor_poll_seconds': int(os.getenv('MONITOR_POLL_SECONDS', '30')),
@@ -205,6 +207,7 @@ class TelegramDerivBot:
         signal: TradingSignal,
         deriv_symbol: str,
         contract_type: str,
+        take_profit_level: Optional[float] = None,
     ) -> None:
         """Poll Deriv until contract closes, then record gain/echec."""
         try:
@@ -240,7 +243,7 @@ class TelegramDerivBot:
                         "direction": signal.direction,
                         "contract_type": contract_type,
                         "entry_price": signal.entry_price,
-                        "tp": signal.take_profits[0] if signal.take_profits else None,
+                        "tp": take_profit_level,
                         "sl": signal.stop_loss,
                         "profit": profit,
                         "outcome": outcome,
@@ -514,6 +517,18 @@ class TelegramDerivBot:
             BUY -> CALL, SELL -> PUT (no LIMIT/STOP logic).
             """
             try:
+                def _record_trade_failure(reason: str, trade_index: Optional[int] = None) -> None:
+                    payload: Dict[str, Any] = {
+                        "symbol": signal.symbol,
+                        "direction": signal.direction,
+                        "entry_price": signal.entry_price,
+                        "reason": reason,
+                    }
+                    if trade_index is not None:
+                        payload["trade_index"] = trade_index
+                    self.history.record_event("trade_execution_failed", payload)
+                    self._log_history_summary()
+
                 if not self.deriv_ws or not self.deriv_connected:
                     logger.error("[TRADE] Deriv API not connected")
                     logger.info("[TRADE] Attempting to reconnect...")
@@ -543,250 +558,237 @@ class TelegramDerivBot:
                 # Note: Deriv uses stake amount, not lot size
                 stake = CONFIG['fixed_lot'] * 100  # 0.02 * 100 = $2
 
-                # Handle multiple TPs - Deriv limit_order supports a single TP level
-                first_tp = signal.take_profits[0] if signal.take_profits else None
-                if len(signal.take_profits) > 1:
-                    logger.info(f"[TRADE] Multiple TPs detected: {signal.take_profits}")
-                    logger.info(f"[TRADE] Using first TP for order: {first_tp}")
+                target_tp_number = max(int(CONFIG.get('target_tp_number', 4)), 1)
+                trades_per_signal = max(int(CONFIG.get('trades_per_signal', 2)), 1)
+                target_tp_index = target_tp_number - 1
 
-                # Create proposal request for immediate execution
-                proposal_request = {
-                    "proposal": 1,
-                    "amount": stake,
-                    "basis": "stake",
-                    "contract_type": contract_type,
-                    "currency": "USD",
-                    "symbol": deriv_symbol,
-                    "duration": 60,  # 60 minutes duration
-                    "duration_unit": "m"
-                }
+                if len(signal.take_profits) <= target_tp_index:
+                    logger.error(
+                        "[TRADE] Signal missing TP%s. Available TPs=%s -> trade skipped",
+                        target_tp_number,
+                        signal.take_profits,
+                    )
+                    _record_trade_failure(f"missing_tp{target_tp_number}")
+                    return False
 
-                # Attempt to attach TP/SL directly to the order when supported by Deriv.
-                limit_order = {}
-                if first_tp is not None:
-                    limit_order["take_profit"] = float(first_tp)
-                if signal.stop_loss is not None:
-                    limit_order["stop_loss"] = float(signal.stop_loss)
-                if limit_order:
-                    proposal_request["limit_order"] = limit_order
+                selected_tp = signal.take_profits[target_tp_index]
+                logger.info(f"[TRADE] Multiple TPs detected: {signal.take_profits}")
+                logger.info(
+                    "[TRADE] Enforcing TP%s only for all trades: %s",
+                    target_tp_number,
+                    selected_tp,
+                )
+                logger.info(
+                    "[TRADE] Opening %s trades with identical TP/SL (entry price ignored)",
+                    trades_per_signal,
+                )
 
-                logger.info(f"[TRADE] Sending proposal request: {proposal_request}")
-                proposal_response = await self._ws_request(proposal_request)
+                opened_count = 0
+                for trade_index in range(1, trades_per_signal + 1):
+                    # Create proposal request for immediate execution
+                    proposal_request = {
+                        "proposal": 1,
+                        "amount": stake,
+                        "basis": "stake",
+                        "contract_type": contract_type,
+                        "currency": "USD",
+                        "symbol": deriv_symbol,
+                        "duration": 60,  # 60 minutes duration
+                        "duration_unit": "m",
+                    }
 
-                if 'error' in proposal_response and "limit_order" in proposal_request:
-                    error_msg = proposal_response['error'].get('message', 'Unknown error')
-                    logger.warning("[TRADE] TP/SL not accepted on this contract type by Deriv API: %s", error_msg)
-                    logger.warning("[TRADE] Retrying immediate market order without TP/SL attachment")
-                    proposal_request = {k: v for k, v in proposal_request.items() if k != "limit_order"}
-                    logger.info(f"[TRADE] Sending fallback proposal request: {proposal_request}")
+                    # Attempt to attach TP/SL directly to the order when supported by Deriv.
+                    limit_order = {}
+                    if selected_tp is not None:
+                        limit_order["take_profit"] = float(selected_tp)
+                    if signal.stop_loss is not None:
+                        limit_order["stop_loss"] = float(signal.stop_loss)
+                    if limit_order:
+                        proposal_request["limit_order"] = limit_order
+
+                    logger.info(
+                        "[TRADE] [%s/%s] Sending proposal request: %s",
+                        trade_index,
+                        trades_per_signal,
+                        proposal_request,
+                    )
                     proposal_response = await self._ws_request(proposal_request)
 
-                if 'error' in proposal_response:
-                    error_code = proposal_response['error'].get('code', 'unknown')
-                    error_msg = proposal_response['error'].get('message', 'Unknown error')
-                    
-                    # Handle insufficient balance error
-                    if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
-                        logger.error(f"[TRADE] Insufficient balance to execute trade")
-                        logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
-                        logger.info(f"[TRADE] Trade skipped due to insufficient funds")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": "insufficient_balance",
-                            },
+                    if 'error' in proposal_response and "limit_order" in proposal_request:
+                        error_msg = proposal_response['error'].get('message', 'Unknown error')
+                        logger.warning(
+                            "[TRADE] [%s/%s] TP/SL not accepted on this contract type by Deriv API: %s",
+                            trade_index,
+                            trades_per_signal,
+                            error_msg,
                         )
-                        self._log_history_summary()
-                        return False
-                    
-                    # Handle market closed error
-                    if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
-                        logger.error(f"[TRADE] Market closed for {deriv_symbol}")
-                        logger.info(f"[TRADE] Trade will be retried when market opens")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": "market_closed",
-                            },
+                        logger.warning(
+                            "[TRADE] [%s/%s] Retrying immediate market order without TP/SL attachment",
+                            trade_index,
+                            trades_per_signal,
                         )
-                        self._log_history_summary()
-                        return False
-                    
-                    # Handle invalid symbol error
-                    if 'symbol' in error_msg.lower() or error_code == 'InvalidSymbol':
-                        logger.error(f"[TRADE] Invalid symbol: {deriv_symbol}")
-                        logger.info(f"[TRADE] Trade skipped due to invalid symbol")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": "invalid_symbol",
-                            },
+                        proposal_request = {k: v for k, v in proposal_request.items() if k != "limit_order"}
+                        logger.info(
+                            "[TRADE] [%s/%s] Sending fallback proposal request: %s",
+                            trade_index,
+                            trades_per_signal,
+                            proposal_request,
                         )
-                        self._log_history_summary()
+                        proposal_response = await self._ws_request(proposal_request)
+
+                    if 'error' in proposal_response:
+                        error_code = proposal_response['error'].get('code', 'unknown')
+                        error_msg = proposal_response['error'].get('message', 'Unknown error')
+
+                        # Handle insufficient balance error
+                        if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
+                            logger.error(f"[TRADE] Insufficient balance to execute trade")
+                            logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
+                            logger.info(f"[TRADE] Trade skipped due to insufficient funds")
+                            _record_trade_failure("insufficient_balance", trade_index)
+                            return False
+
+                        # Handle market closed error
+                        if 'closed' in error_msg.lower() or error_code == 'MarketIsClosed':
+                            logger.error(f"[TRADE] Market closed for {deriv_symbol}")
+                            logger.info(f"[TRADE] Trade will be retried when market opens")
+                            _record_trade_failure("market_closed", trade_index)
+                            return False
+
+                        # Handle invalid symbol error
+                        if 'symbol' in error_msg.lower() or error_code == 'InvalidSymbol':
+                            logger.error(f"[TRADE] Invalid symbol: {deriv_symbol}")
+                            logger.info(f"[TRADE] Trade skipped due to invalid symbol")
+                            _record_trade_failure("invalid_symbol", trade_index)
+                            return False
+
+                        # Generic error handling
+                        logger.error(f"[TRADE] Proposal error (code: {error_code}): {error_msg}")
+                        logger.info(f"[TRADE] Trade skipped")
+                        _record_trade_failure(f"proposal_error:{error_code}", trade_index)
                         return False
-                    
-                    # Generic error handling
-                    logger.error(f"[TRADE] Proposal error (code: {error_code}): {error_msg}")
-                    logger.info(f"[TRADE] Trade skipped")
+
+                    if 'proposal' not in proposal_response:
+                        logger.error(f"[TRADE] Invalid proposal response")
+                        logger.info(f"[TRADE] Trade skipped")
+                        _record_trade_failure("invalid_proposal_response", trade_index)
+                        return False
+
+                    proposal_id = proposal_response['proposal']['id']
+                    logger.info(
+                        "[TRADE] [%s/%s] Proposal validated: %s",
+                        trade_index,
+                        trades_per_signal,
+                        proposal_id,
+                    )
+
+                    # Execute trade via buy API (equivalent to MT5's order_send)
+                    buy_request = {
+                        "buy": proposal_id,
+                        "price": stake,
+                    }
+
+                    logger.info(
+                        "[TRADE] [%s/%s] Executing buy request: %s",
+                        trade_index,
+                        trades_per_signal,
+                        buy_request,
+                    )
+                    buy_response = await self._ws_request(buy_request)
+
+                    if 'error' in buy_response:
+                        error_code = buy_response['error'].get('code', 'unknown')
+                        error_msg = buy_response['error'].get('message', 'Unknown error')
+
+                        # Handle insufficient balance error
+                        if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
+                            logger.error(f"[TRADE] Insufficient balance to execute trade")
+                            logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
+                            logger.info(f"[TRADE] Trade skipped due to insufficient funds")
+                            _record_trade_failure("insufficient_balance", trade_index)
+                            return False
+
+                        # Handle authentication failure
+                        if 'auth' in error_msg.lower() or error_code in ['AuthorizationRequired', 'InvalidToken']:
+                            logger.error(f"[TRADE] Authentication failure: {error_msg}")
+                            logger.info(f"[TRADE] Attempting to reconnect...")
+                            if await self._connect_deriv():
+                                logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
+                            else:
+                                logger.error(f"[TRADE] Reconnection failed")
+                            _record_trade_failure("auth_failure", trade_index)
+                            return False
+
+                        logger.error(f"[TRADE] Buy error (code: {error_code}): {error_msg}")
+                        logger.info(f"[TRADE] Trade skipped")
+                        _record_trade_failure(f"buy_error:{error_code}", trade_index)
+                        return False
+
+                    if 'buy' not in buy_response:
+                        logger.error(f"[TRADE] Invalid buy response")
+                        logger.info(f"[TRADE] Trade skipped")
+                        _record_trade_failure("invalid_buy_response", trade_index)
+                        return False
+
+                    contract_id = buy_response['buy']['contract_id']
+                    buy_price = buy_response['buy']['buy_price']
+
+                    logger.info("=" * 60)
+                    logger.info(" TRADE EXECUTED SUCCESSFULLY")
+                    logger.info(f"Trade: {trade_index}/{trades_per_signal}")
+                    logger.info(f"Contract ID: {contract_id}")
+                    logger.info(f"Symbol: {deriv_symbol}")
+                    logger.info(f"Type: {contract_type}")
+                    logger.info(f"Entry: {signal.entry_price}")
+                    logger.info(f"Stake: ${stake}")
+                    logger.info(f"Buy Price: ${buy_price}")
+                    logger.info(
+                        "Take Profit (TP%s): %s",
+                        target_tp_number,
+                        selected_tp,
+                    )
+                    logger.info(f"Stop Loss: {signal.stop_loss}")
+                    logger.info("=" * 60)
+
+                    if selected_tp or signal.stop_loss:
+                        logger.info("[TRADE] TP/SL requested on order")
+
                     self.history.record_event(
-                        "trade_execution_failed",
+                        "trade_opened",
                         {
+                            "contract_id": contract_id,
                             "symbol": signal.symbol,
+                            "deriv_symbol": deriv_symbol,
                             "direction": signal.direction,
+                            "contract_type": contract_type,
                             "entry_price": signal.entry_price,
-                            "reason": f"proposal_error:{error_code}",
+                            "buy_price": buy_price,
+                            "stake": stake,
+                            "tp": selected_tp,
+                            "sl": signal.stop_loss,
+                            "trade_index": trade_index,
+                            "trades_per_signal": trades_per_signal,
                         },
                     )
                     self._log_history_summary()
-                    return False
-
-                if 'proposal' not in proposal_response:
-                    logger.error(f"[TRADE] Invalid proposal response")
-                    logger.info(f"[TRADE] Trade skipped")
-                    self.history.record_event(
-                        "trade_execution_failed",
-                        {
-                            "symbol": signal.symbol,
-                            "direction": signal.direction,
-                            "entry_price": signal.entry_price,
-                            "reason": "invalid_proposal_response",
-                        },
-                    )
-                    self._log_history_summary()
-                    return False
-
-                proposal_id = proposal_response['proposal']['id']
-                logger.info(f"[TRADE]  Proposal validated: {proposal_id}")
-
-                # Execute trade via buy API (equivalent to MT5's order_send)
-                buy_request = {
-                    "buy": proposal_id,
-                    "price": stake
-                }
-
-                logger.info(f"[TRADE] Executing buy request: {buy_request}")
-                buy_response = await self._ws_request(buy_request)
-
-                if 'error' in buy_response:
-                    error_code = buy_response['error'].get('code', 'unknown')
-                    error_msg = buy_response['error'].get('message', 'Unknown error')
-                    
-                    # Handle insufficient balance error
-                    if 'balance' in error_msg.lower() or error_code == 'InsufficientBalance':
-                        logger.error(f"[TRADE] Insufficient balance to execute trade")
-                        logger.error(f"[TRADE] Required stake: ${stake}, check account balance")
-                        logger.info(f"[TRADE] Trade skipped due to insufficient funds")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": "insufficient_balance",
-                            },
+                    monitor_task = asyncio.create_task(
+                        self._monitor_contract_result(
+                            contract_id,
+                            signal,
+                            deriv_symbol,
+                            contract_type,
+                            selected_tp,
                         )
-                        self._log_history_summary()
-                        return False
-                    
-                    # Handle authentication failure
-                    if 'auth' in error_msg.lower() or error_code in ['AuthorizationRequired', 'InvalidToken']:
-                        logger.error(f"[TRADE] Authentication failure: {error_msg}")
-                        logger.info(f"[TRADE] Attempting to reconnect...")
-                        if await self._connect_deriv():
-                            logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
-                        else:
-                            logger.error(f"[TRADE] Reconnection failed")
-                        self.history.record_event(
-                            "trade_execution_failed",
-                            {
-                                "symbol": signal.symbol,
-                                "direction": signal.direction,
-                                "entry_price": signal.entry_price,
-                                "reason": "auth_failure",
-                            },
-                        )
-                        self._log_history_summary()
-                        return False
-                    
-                    logger.error(f"[TRADE] Buy error (code: {error_code}): {error_msg}")
-                    logger.info(f"[TRADE] Trade skipped")
-                    self.history.record_event(
-                        "trade_execution_failed",
-                        {
-                            "symbol": signal.symbol,
-                            "direction": signal.direction,
-                            "entry_price": signal.entry_price,
-                            "reason": f"buy_error:{error_code}",
-                        },
                     )
-                    self._log_history_summary()
-                    return False
+                    self._track_task(monitor_task)
+                    opened_count += 1
 
-                if 'buy' not in buy_response:
-                    logger.error(f"[TRADE] Invalid buy response")
-                    logger.info(f"[TRADE] Trade skipped")
-                    self.history.record_event(
-                        "trade_execution_failed",
-                        {
-                            "symbol": signal.symbol,
-                            "direction": signal.direction,
-                            "entry_price": signal.entry_price,
-                            "reason": "invalid_buy_response",
-                        },
-                    )
-                    self._log_history_summary()
-                    return False
-
-                contract_id = buy_response['buy']['contract_id']
-                buy_price = buy_response['buy']['buy_price']
-
-                logger.info("=" * 60)
-                logger.info(" TRADE EXECUTED SUCCESSFULLY")
-                logger.info(f"Contract ID: {contract_id}")
-                logger.info(f"Symbol: {deriv_symbol}")
-                logger.info(f"Type: {contract_type}")
-                logger.info(f"Entry: {signal.entry_price}")
-                logger.info(f"Stake: ${stake}")
-                logger.info(f"Buy Price: ${buy_price}")
-                if first_tp:
-                    logger.info(f"Take Profit: {first_tp}")
-                logger.info(f"Stop Loss: {signal.stop_loss}")
-                logger.info("=" * 60)
-
-                if first_tp or signal.stop_loss:
-                    logger.info("[TRADE] TP/SL requested on order")
-
-                self.history.record_event(
-                    "trade_opened",
-                    {
-                        "contract_id": contract_id,
-                        "symbol": signal.symbol,
-                        "deriv_symbol": deriv_symbol,
-                        "direction": signal.direction,
-                        "contract_type": contract_type,
-                        "entry_price": signal.entry_price,
-                        "buy_price": buy_price,
-                        "stake": stake,
-                        "tp": first_tp,
-                        "sl": signal.stop_loss,
-                    },
+                logger.info(
+                    "[TRADE] Opened %s/%s trades with identical TP/SL",
+                    opened_count,
+                    trades_per_signal,
                 )
-                self._log_history_summary()
-                monitor_task = asyncio.create_task(
-                    self._monitor_contract_result(contract_id, signal, deriv_symbol, contract_type)
-                )
-                self._track_task(monitor_task)
-
-                return True
+                return opened_count == trades_per_signal
 
             except websockets.exceptions.WebSocketException as e:
                 logger.error(f"[TRADE] WebSocket error executing trade: {e}")
@@ -795,31 +797,13 @@ class TelegramDerivBot:
                     logger.info(f"[TRADE]  Reconnected - Please retry trade manually")
                 else:
                     logger.error(f"[TRADE] Reconnection failed")
-                self.history.record_event(
-                    "trade_execution_failed",
-                    {
-                        "symbol": signal.symbol,
-                        "direction": signal.direction,
-                        "entry_price": signal.entry_price,
-                        "reason": "websocket_error",
-                    },
-                )
-                self._log_history_summary()
+                _record_trade_failure("websocket_error")
                 return False
             except Exception as e:
                 logger.error(f"[TRADE] Unexpected error executing trade: {e}")
                 logger.exception(e)
                 logger.info(f"[TRADE] Trade skipped due to error")
-                self.history.record_event(
-                    "trade_execution_failed",
-                    {
-                        "symbol": signal.symbol,
-                        "direction": signal.direction,
-                        "entry_price": signal.entry_price,
-                        "reason": "unexpected_error",
-                    },
-                )
-                self._log_history_summary()
+                _record_trade_failure("unexpected_error")
                 return False
             
     async def handle_new_message(self, event):

@@ -41,7 +41,7 @@ class TestDerivLimitOrderFallback(unittest.IsolatedAsyncioTestCase):
             symbol="XAUUSD",
             direction="SELL",
             entry_price=5104.0,
-            take_profits=[5101.0, 5098.0],
+            take_profits=[5101.0, 5098.0, 5095.0, 5092.0],
             stop_loss=5115.0,
             raw_text="#XAUUSD SELL 5104",
             received_at=datetime.now(timezone.utc),
@@ -71,6 +71,7 @@ class TestDerivLimitOrderFallback(unittest.IsolatedAsyncioTestCase):
         first_request = bot._ws_request.await_args_list[0].args[0]
         second_request = bot._ws_request.await_args_list[1].args[0]
         self.assertIn("limit_order", first_request)
+        self.assertEqual(first_request["limit_order"]["take_profit"], 5092.0)
         self.assertNotIn("limit_order", second_request)
 
 
