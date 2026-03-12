@@ -75,5 +75,26 @@ class TestDerivLimitOrderFallback(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("limit_order", second_request)
 
 
+class TestExecutionBackendRouting(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_trade_uses_mt5_relay_when_enabled(self):
+        bot = TelegramDerivBot()
+        signal = TradingSignal(
+            symbol="XAUUSD",
+            direction="SELL",
+            entry_price=5104.0,
+            take_profits=[5101.0, 5098.0, 5095.0, 5092.0],
+            stop_loss=5115.0,
+            raw_text="#XAUUSD SELL 5104",
+            received_at=datetime.now(timezone.utc),
+        )
+        bot.execute_trade_mt5_relay = AsyncMock(return_value=True)
+
+        with patch.dict("bot_vps_gram_mt.CONFIG", {"execution_backend": "mt5_relay"}, clear=False):
+            success = await bot.execute_trade(signal)
+
+        self.assertTrue(success)
+        bot.execute_trade_mt5_relay.assert_awaited_once_with(signal)
+
+
 if __name__ == "__main__":
     unittest.main()

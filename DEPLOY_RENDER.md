@@ -48,6 +48,20 @@ Dans l'onglet **"Environment"** de votre service Render, ajoutez:
 | `FIXED_LOT` | `0.02` | Taille du lot (stake) |
 | `PORT` | `10000` | Port HTTP (requis par Render) |
 
+### Option 2 (Render -> MT5 Relay VPS)
+
+Si vous voulez exécuter les ordres sur MT5 via un relay privé VPS:
+
+| Key | Value |
+|-----|-------|
+| `EXECUTION_BACKEND` | `mt5_relay` |
+| `MT5_RELAY_URL` | `https://votre-vps:9000` |
+| `MT5_RELAY_API_KEY` | `[secret partagé avec le relay]` |
+| `MT5_RELAY_TIMEOUT_SECONDS` | `20` |
+| `MT5_SYMBOL_MAP` | `XAUUSD:XAUUSDm,EURUSD:EURUSDm` (optionnel) |
+
+Laissez `EXECUTION_BACKEND=deriv` si vous continuez à trader via Deriv API.
+
  **Important**: 
 - Ne partagez JAMAIS ces valeurs publiquement!
 - **ARRÊTEZ le bot localement** avant de déployer sur Render (sinon erreur AuthKeyDuplicated)

@@ -1,0 +1,2 @@
+@reboot /bin/bash "/home/julia/Elements/Person project/Creation Bots trading/telegram_mt5_bot/cron_supervisor.sh"
+*/5 * * * * /bin/bash "/home/julia/Elements/Person project/Creation Bots trading/telegram_mt5_bot/cron_supervisor.sh"

@@ -39,10 +39,17 @@ CONFIG = {
     'telegram_api_id': int(os.getenv('TELEGRAM_API_ID', '0')),
     'telegram_api_hash': os.getenv('TELEGRAM_API_HASH', ''),
     'channel_username': os.getenv('CHANNEL_USERNAME', 'hunto4x_fullaccourcy92'),
+    'execution_backend': os.getenv('EXECUTION_BACKEND', 'deriv').strip().lower(),
     
     # Deriv API configuration
     'deriv_api_token': os.getenv('DERIV_API_TOKEN', ''),
     'deriv_app_id': os.getenv('DERIV_APP_ID', '1089'),  # Default for binary.com
+
+    # MT5 relay configuration (Option 2: Render bot -> VPS relay)
+    'mt5_relay_url': os.getenv('MT5_RELAY_URL', '').strip(),
+    'mt5_relay_api_key': os.getenv('MT5_RELAY_API_KEY', '').strip(),
+    'mt5_relay_timeout_seconds': int(os.getenv('MT5_RELAY_TIMEOUT_SECONDS', '20')),
+    'mt5_symbol_map': os.getenv('MT5_SYMBOL_MAP', '').strip(),
     
     # Deprecated MT5 configuration (no longer used)
     # 'mt5_account': int(os.getenv('MT5_ACCOUNT', '0')),
@@ -266,13 +273,22 @@ class TelegramDerivBot:
     async def initialize(self):
         """Initialisation du bot"""
         logger.info("=" * 60)
-        logger.info("DÉMARRAGE DU BOT TRADING TELEGRAM -> DERIV API")
+        logger.info(
+            "DÉMARRAGE DU BOT TRADING TELEGRAM -> %s",
+            CONFIG['execution_backend'].upper(),
+        )
         logger.info("=" * 60)
         self._log_history_summary()
-        
-        # Connexion Deriv API
-        if not await self._connect_deriv():
-            raise Exception("Impossible de connecter Deriv API")
+
+        backend = CONFIG['execution_backend']
+        if backend == "deriv":
+            if not await self._connect_deriv():
+                raise Exception("Impossible de connecter Deriv API")
+        elif backend == "mt5_relay":
+            logger.info("[MT5 Relay] Execution via VPS relay enabled")
+            logger.info("[MT5 Relay] Endpoint: %s", CONFIG['mt5_relay_url'])
+        else:
+            raise Exception(f"Backend d'exécution invalide: {backend}")
             
         # Connexion Telegram
         await self._connect_telegram()
@@ -510,12 +526,189 @@ class TelegramDerivBot:
                 logger.exception(e)
                 logger.info(f"[Symbol] Trade skipped due to error")
                 return None
+
+    def _resolve_trade_plan(self, signal: TradingSignal) -> Optional[Dict[str, Any]]:
+        target_tp_number = max(int(CONFIG.get('target_tp_number', 4)), 1)
+        trades_per_signal = max(int(CONFIG.get('trades_per_signal', 2)), 1)
+        target_tp_index = target_tp_number - 1
+        if len(signal.take_profits) <= target_tp_index:
+            return None
+        selected_tp = signal.take_profits[target_tp_index]
+        return {
+            "target_tp_number": target_tp_number,
+            "trades_per_signal": trades_per_signal,
+            "selected_tp": selected_tp,
+        }
+
+    def _map_symbol_for_mt5_relay(self, signal_symbol: str) -> str:
+        raw_map = CONFIG.get('mt5_symbol_map', '')
+        mapping: Dict[str, str] = {}
+        if raw_map:
+            for item in raw_map.split(','):
+                item = item.strip()
+                if not item:
+                    continue
+                if ':' not in item:
+                    logger.warning("[MT5 Relay] Invalid MT5_SYMBOL_MAP item ignored: %s", item)
+                    continue
+                src, dst = item.split(':', 1)
+                src = src.strip().upper()
+                dst = dst.strip()
+                if not src or not dst:
+                    continue
+                mapping[src] = dst
+
+        signal_symbol_up = signal_symbol.upper()
+        mapped = mapping.get(signal_symbol_up, signal_symbol_up)
+        if mapped != signal_symbol_up:
+            logger.info("[MT5 Relay] Symbol mapped %s -> %s", signal_symbol_up, mapped)
+        return mapped
+
+    async def execute_trade_mt5_relay(self, signal: TradingSignal) -> bool:
+        def _record_trade_failure(reason: str, trade_index: Optional[int] = None) -> None:
+            payload: Dict[str, Any] = {
+                "symbol": signal.symbol,
+                "direction": signal.direction,
+                "entry_price": signal.entry_price,
+                "reason": reason,
+                "execution_backend": "mt5_relay",
+            }
+            if trade_index is not None:
+                payload["trade_index"] = trade_index
+            self.history.record_event("trade_execution_failed", payload)
+            self._log_history_summary()
+
+        try:
+            trade_plan = self._resolve_trade_plan(signal)
+            if trade_plan is None:
+                target_tp_number = max(int(CONFIG.get('target_tp_number', 4)), 1)
+                logger.error(
+                    "[MT5 Relay] Signal missing TP%s. Available TPs=%s -> trade skipped",
+                    target_tp_number,
+                    signal.take_profits,
+                )
+                _record_trade_failure(f"missing_tp{target_tp_number}")
+                return False
+
+            if signal.direction not in {"BUY", "SELL"}:
+                logger.error("[MT5 Relay] Invalid direction: %s", signal.direction)
+                _record_trade_failure("invalid_direction")
+                return False
+
+            selected_tp = float(trade_plan["selected_tp"])
+            trades_per_signal = int(trade_plan["trades_per_signal"])
+            target_tp_number = int(trade_plan["target_tp_number"])
+            mt5_symbol = self._map_symbol_for_mt5_relay(signal.symbol)
+
+            endpoint = f"{CONFIG['mt5_relay_url'].rstrip('/')}/trade"
+            payload = {
+                "symbol": mt5_symbol,
+                "direction": signal.direction,
+                "entry_price": signal.entry_price,
+                "tp": selected_tp,
+                "sl": float(signal.stop_loss),
+                "volume": float(CONFIG['fixed_lot']),
+                "trades_count": trades_per_signal,
+                "target_tp_number": target_tp_number,
+                "source": "telegram_render_bot",
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if CONFIG['mt5_relay_api_key']:
+                headers["Authorization"] = f"Bearer {CONFIG['mt5_relay_api_key']}"
+
+            timeout = aiohttp.ClientTimeout(total=max(CONFIG.get('mt5_relay_timeout_seconds', 20), 5))
+
+            logger.info("[MT5 Relay] Sending trade request: endpoint=%s payload=%s", endpoint, payload)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, json=payload, headers=headers) as response:
+                    raw_body = await response.text()
+                    try:
+                        relay_response = json.loads(raw_body) if raw_body else {}
+                    except json.JSONDecodeError:
+                        relay_response = {"raw_body": raw_body}
+
+                    if response.status >= 400:
+                        logger.error(
+                            "[MT5 Relay] HTTP error status=%s response=%s",
+                            response.status,
+                            relay_response,
+                        )
+                        _record_trade_failure(f"relay_http_{response.status}")
+                        return False
+
+            if not relay_response.get("success"):
+                reason = relay_response.get("reason", "relay_rejected")
+                logger.error("[MT5 Relay] Relay rejected trade: %s", relay_response)
+                _record_trade_failure(f"relay_error:{reason}")
+                return False
+
+            orders = relay_response.get("orders", [])
+            opened_count = len(orders)
+            if opened_count == 0:
+                logger.error("[MT5 Relay] No order returned by relay: %s", relay_response)
+                _record_trade_failure("relay_no_order")
+                return False
+
+            logger.info(
+                "[MT5 Relay] Relay opened %s/%s orders with TP%s=%s and SL=%s",
+                opened_count,
+                trades_per_signal,
+                target_tp_number,
+                selected_tp,
+                signal.stop_loss,
+            )
+            for idx, order in enumerate(orders, start=1):
+                ticket = order.get("ticket")
+                trade_index = int(order.get("trade_index", idx))
+                fill_price = order.get("price")
+                self.history.record_event(
+                    "trade_opened",
+                    {
+                        "contract_id": ticket,
+                        "symbol": signal.symbol,
+                        "deriv_symbol": mt5_symbol,
+                        "direction": signal.direction,
+                        "contract_type": signal.direction,
+                        "entry_price": signal.entry_price,
+                        "buy_price": fill_price,
+                        "stake": float(CONFIG['fixed_lot']),
+                        "tp": selected_tp,
+                        "sl": signal.stop_loss,
+                        "trade_index": trade_index,
+                        "trades_per_signal": trades_per_signal,
+                        "execution_backend": "mt5_relay",
+                    },
+                )
+
+            self._log_history_summary()
+            if opened_count != trades_per_signal:
+                _record_trade_failure(f"partial_open:{opened_count}/{trades_per_signal}")
+                return False
+            return True
+        except aiohttp.ClientError as e:
+            logger.error("[MT5 Relay] HTTP client error: %s", e)
+            _record_trade_failure("relay_connection_error")
+            return False
+        except asyncio.TimeoutError:
+            logger.error("[MT5 Relay] Request timeout")
+            _record_trade_failure("relay_timeout")
+            return False
+        except Exception as e:
+            logger.error("[MT5 Relay] Unexpected error: %s", e)
+            logger.exception(e)
+            _record_trade_failure("relay_unexpected_error")
+            return False
         
     async def execute_trade(self, signal: TradingSignal) -> bool:
             """
             Execute trade immediately from Telegram signal.
-            BUY -> CALL, SELL -> PUT (no LIMIT/STOP logic).
             """
+            if CONFIG['execution_backend'] == "mt5_relay":
+                return await self.execute_trade_mt5_relay(signal)
+
             try:
                 def _record_trade_failure(reason: str, trade_index: Optional[int] = None) -> None:
                     payload: Dict[str, Any] = {
@@ -887,12 +1080,31 @@ class TelegramDerivBot:
 
 def validate_config():
     """Validation de la configuration"""
-    required = {
+    backend = CONFIG['execution_backend']
+    common_required = {
         'TELEGRAM_API_ID': CONFIG['telegram_api_id'],
         'TELEGRAM_API_HASH': CONFIG['telegram_api_hash'],
-        'DERIV_API_TOKEN': CONFIG['deriv_api_token'],
-        'DERIV_APP_ID': CONFIG['deriv_app_id'],
     }
+
+    if backend == 'deriv':
+        backend_required = {
+            'DERIV_API_TOKEN': CONFIG['deriv_api_token'],
+            'DERIV_APP_ID': CONFIG['deriv_app_id'],
+        }
+    elif backend == 'mt5_relay':
+        backend_required = {
+            'MT5_RELAY_URL': CONFIG['mt5_relay_url'],
+            'MT5_RELAY_API_KEY': CONFIG['mt5_relay_api_key'],
+        }
+    else:
+        print("\n" + "*" * 30)
+        print("ERREUR: EXECUTION_BACKEND invalide!")
+        print("*" * 30)
+        print(f"\nValeur actuelle: {backend}")
+        print("Valeurs supportées: deriv, mt5_relay")
+        return False
+
+    required = {**common_required, **backend_required}
     
     missing = [k for k, v in required.items() if not v or v == 0]
     
@@ -903,8 +1115,13 @@ def validate_config():
         print(f"\nVariables manquantes: {', '.join(missing)}")
         print("\nCréez un fichier .env avec:")
         print("-" * 40)
-        print('DERIV_API_TOKEN="your_api_token_here"  # Obtain from https://app.deriv.com/account/api-token')
-        print('DERIV_APP_ID="1089"  # Default for binary.com')
+        print('EXECUTION_BACKEND="deriv"  # ou "mt5_relay"')
+        if backend == 'deriv':
+            print('DERIV_API_TOKEN="your_api_token_here"  # Obtain from https://app.deriv.com/account/api-token')
+            print('DERIV_APP_ID="1089"  # Default for binary.com')
+        else:
+            print('MT5_RELAY_URL="https://your-relay-host/trade-base-url"')
+            print('MT5_RELAY_API_KEY="your_private_shared_secret"')
         print("FIXED_LOT=0.02")
         print("-" * 40)
         print("\n  Deprecated (no longer used):")
