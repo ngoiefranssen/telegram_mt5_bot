@@ -1,0 +1,45 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0\fnil\fcharset0 Verdana;}}
+\fs24
+\b Stratege Compl\'e8te du Bot Telegram -> MT5/Deriv\b0\par
+\par
+\b1. Contexte architectural\b0\par
+Ce bot lit les notifications de signal du canal Telegram configur\'e9 via les variables \cf1\lang1036 CHANNEL_USERNAME\cf0 , \cf1\lang1036 TELEGRAM_API_ID\cf0  et \cf1\lang1036 TELEGRAM_API_HASH\cf0 . Il se comporte ensuite comme un pont entre ce flux et deux options d'ex\'e9cution : l'API WebSocket Deriv ou un service MT5 relay HTTP en sortie de Render/VPS.\par
+\par
+\b2. Détection et parsing de signal\b0\par
+Les messages valides doivent avoir au moins trois lignes. La premi\'e8re ligne (header) est analys\'e9 avec l'expression \cf2#?\s*(\w+)\s+(BUY|SELL)\s+(\d+\.?\d*)\cf0  (symbole, direction, prix d'entr\'e9e). Les lignes subs\'e9quentes fournissent les niveaux TP et SL avec des motifs adaptables (TP1: 5133, TP2.@ 5138, SL @ 5118, etc.). Toutes les valeurs manquantes m\'e8nent au rejet du signal. Un objet \cf2TradingSignal\cf0  conserve symbole, direction, liste TP, SL, texte brut et horodatage.\par
+\par
+\b3. Cartographie des symboles\b0\par
+Des mappages explicites (XAUUSD -> frxXAUUSD, BTCUSD -> cryBTCUSD, etc.) sont appliqu\'e9s pour correspondre aux symboles Validator de Deriv. Le bot interroge l'API \cf2active_symbols\cf0  pour confirmer que le symbole mapp\'e9 est bien actif. Toute incoh\'e9rence annule l'ex\'e9cution.\par
+\par
+\b4. Plan de trade et configuration\b0\par
+Les variables d'environnement orientent la logique : \cf1TARGET_TP_NUMBER\cf0  (par d\'e9faut 4), \cf1TRADES_PER_SIGNAL\cf0  (2) et \cf1FIXED_LOT\cf0  (0,02). Le bot ne retient que la TP cible (TP4 si TARGET_TP_NUMBER=4). Il envoie plusieurs ordres identiques (TP/SL rigides). Le montant de mise sur Deriv correspond \`a `LOT * 100` (ex \cf10.02\cf0  -> 2 USD).\par
+\par
+\b5. Exécution via Deriv API\b0\par
+\bullet Connexion par WebSocket (app_id par d\'e9faut 1089) et autorisation via \cf1DERIV_API_TOKEN\cf0 .\par
+\bullet Pour chaque signal valide : on d\'e9termine \cf2CALL\cf0 /\cf2PUT\cf0  selon BUY/SELL, on demande une \cf2proposal\cf0  (duration 60 minutes). Le bot tente d'attacher une \cf2limit_order\cf0  (take_profit + stop_loss) et, en cas de refus, relance sans.\par
+\bullet Si la \cf2proposal\cf0  passe, on ex\'e9cute le \cf2buy\cf0  avec le stake. Le contrat ouvert est logg\'e via \cf2TradeHistoryStore\cf0  et un suivi asynchrone capitalise le profit ou la perte.\par
+\bullet En cas d'erreurs (solde insuffisant, marche ferm\'e9e, symb\'ole invalide, auth, websocket), un enregistrement \cf2trade_execution_failed\cf0  documente la cause et arr\'eate la s\'e9rie.\par
+\par
+\b6. Exécution via MT5 Relay\b0\par
+\bullet Le plan de trade (TP cible, number trades) est transmis par POST JSON vers \cf1MT5_RELAY_URL/trade\cf0  avec cl\'e9 API optionnelle.\par
+\bullet Le payload inclut symbole (possiblement remapp\'e9 via \cf1MT5_SYMBOL_MAP\cf0 ), direction, TP, SL, volume (FIxed lot) et nombre de trades.\par
+\bullet On enregistre chaque ordre re\'c9u, on v\'erifie qu'on a bien tous les tickets et, sinon, on trace un \cf2partial_open\cf0 .\par
+\bullet Les erreurs HTTP ou du relay (timeout, refus, erreur JSON) sont historis\'e9es afin d'\'etudier la fiabilit\'e9.\par
+\par
+\b7. Suivi et gouvernance\b0\par
+\bullet \cf2TradeHistoryStore\cf0  enregistre \cf2trade_opened\cf0 , \cf2trade_closed\cf0  et \cf2trade_execution_failed\cf0  dans \cf1trade_history.jsonl\cf0 .\par
+\bullet Une t\'e9l\'e2ve de t\'e9l\'e9chargement complet (7j/30j) permet d'estimer gains, echec, pertes neutres et contrats en attente.\par
+\bullet Chaque contrat est surveill\'e9 (polling toutes les 30 secondes par d\'efaut) jusqu\'a ce qu'il soit clotur\'e9 et que les profits soient class\'e9s.\par
+\par
+\b8. Interface web et d\'e9ploiement\b0\par
+Un serveur HTTP minimal expose \cf1/health\cf0 , \cf1/\cf0  et \cf1/stats\cf0  (7j/30j) pour Render. \cf1PORT\cf0  d\'e9faut 10000. On peut d\'e9ployer avec une session Telegram stock\'e9e dans \cf1TELEGRAM_SESSION\cf0  (StringSession) ou locale (fichier).\par
+\par
+\b9. Logging et surveillance\b0\par
+Tout se logge dans \cf1trading_bot.log\cf0  plus la console. Les messages incluent niveaux d'erreur (connexion Deriv, parsing, ex\'e9cution) et les r\'e9ponses d'API. Les historiques facilient le diagnostic post-trade.\par
+\par
+\b10. Recommandations\b0\par
+- Valider l'environnement (.env) avant ex\'e9cution; la fonction \cf2validate_config\cf0  refuse la course si des variables essentielles manquent.\par
+- Prioriser Deriv pour la clart\'e9 de la logique de TP/SL; MT5 relay est utile pour des plateformes MT5 sp\'e9cifiques.\par
+- Revoir les logs \cf1trading_bot.log\cf0  et les exports \cf1trade_history.jsonl\cf0  pour comprendre les pertes et r\'e9examiner les signaux trait\'e9s.\par
+}
